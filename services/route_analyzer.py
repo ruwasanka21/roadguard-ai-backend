@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 NOISE_BAND          = 1.5    # °  — deltas smaller than this are GPS jitter
 REVERSAL_TOLERANCE  = 10.0   # °  — absorb up to this much opposite-turn before split
 SCAN_WIN            = 6      # edges — half-window for localised peak scan
-SHARP_THRESH        = 45.0   # °  — is_sharp_turn = True above this
+SHARP_THRESH        = 60.0   # °  — is_sharp_turn = True above this
 MAX_SEG_M           = 2000.0 # m  — cap for straight/gentle groups (rendering)
 MIN_SEG_M           = 5.0    # m  — ignore zero-length artefacts
 

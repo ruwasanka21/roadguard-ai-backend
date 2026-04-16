@@ -1,40 +1,46 @@
 """
 Risk scorer — weighted feature classification.
 
-Score composition (0–100):
-  bend severity   → 0–45 pts   (BendCategory graduated scale)
-  cluster bonus   → ×1.4 multiplier when consecutiveSharpCount ≥ 3
-  weather         → 0–30 pts
-  wind            → 0–10 pts   (linear above 30 km/h)
-  slope           → 0–5 pts    (bonus when |slope| > 10 %)
+Score composition (0-100):
+  bend severity   -> 0-70 pts   (BendCategory graduated scale)
+  cluster bonus   -> x1.3 multiplier when consecutiveSharpCount >= 3
+  weather         -> 0-30 pts
+  wind            -> 0-10 pts   (linear above 30 km/h)
+  slope           -> 0-5 pts    (bonus when |slope| > 10%)
 
 Classification:
-  score ≥ 50  → high   (was 65 — sharp bend should count!)
-  score ≥ 25  → medium  (was 35 — a detected sharp bend in clear weather = medium)
-  else        → low
+  score >= 50  -> high    (sharp bend alone = High)
+  score >= 25  -> medium  (moderate bend alone = Medium)
+  else         -> low
+
+Category angle thresholds (tuned for mountain driving):
+  hairpin  >= 100 degrees
+  sharp    >=  60 degrees   (66 degrees IS a sharp mountain turn!)
+  moderate >=  30 degrees
+  gentle   >=  10 degrees
 
 Dynamic look-ahead:
-  hairpin  → 800 m
-  sharp    → 600 m
-  moderate → 350 m (450 m in rain/fog)
-  other    → 300 m
+  hairpin  -> 800 m
+  sharp    -> 600 m
+  moderate -> 350 m (450 m in rain/fog)
+  other    -> 300 m
 """
 from dataclasses import dataclass
 from models.response import BendCategory, RiskLevel, SegmentResponse
 
 
-# ── Bend score lookup ─────────────────────────────────────────────────────────
+# -- Bend score lookup --------------------------------------------------------
 
 _BEND_SCORE: dict[BendCategory, float] = {
     BendCategory.none:     0.0,
-    BendCategory.gentle:   5.0,   # barely noticeable curve
-    BendCategory.moderate: 20.0,  # notable curve,  alone = Low, rain = Medium
-    BendCategory.sharp:    35.0,  # sharp bend,     alone = Medium
-    BendCategory.hairpin:  55.0,  # hairpin,        alone = High
+    BendCategory.gentle:   10.0,  # slight curve  -> Low alone, Medium in bad weather
+    BendCategory.moderate: 25.0,  # 30-60 deg     -> Medium alone
+    BendCategory.sharp:    50.0,  # 60-100 deg    -> High alone
+    BendCategory.hairpin:  70.0,  # >100 deg      -> High alone (well above threshold)
 }
 
 
-# ── Internal segment dataclass (lives only inside the pipeline) ───────────────
+# -- Internal segment dataclass (lives only inside the pipeline) --------------
 
 @dataclass
 class _Seg:
@@ -64,25 +70,25 @@ def score_segments(segments: list[_Seg], req) -> list[_Seg]:
 def _score(seg: _Seg, req) -> tuple[float, RiskLevel, float]:
     score = 0.0
 
-    # ── 1. Bend severity ─────────────────────────────────────────────────────
+    # -- 1. Bend severity -----------------------------------------------------
     bend_pts = _BEND_SCORE[seg.bend_category]
 
-    # Cluster multiplier: ≥ 3 consecutive sharp / hairpin segments → ×1.4
-    # Cap raised to 65 so the multiplier is actually meaningful for all categories.
+    # Cluster multiplier: >= 3 consecutive sharp/hairpin segments -> x1.3
+    # Cap at 80 so moderate clusters can also reach High range.
     if seg.consecutive_sharp_count >= 3:
-        bend_pts = min(bend_pts * 1.4, 65.0)
+        bend_pts = min(bend_pts * 1.3, 80.0)
 
     score += bend_pts
 
-    # ── 2. Weather ───────────────────────────────────────────────────────────
+    # -- 2. Weather -----------------------------------------------------------
     score += _weather_score(req)
 
-    # ── 3. Wind (linear ramp 30→100 km/h maps to 0→10 pts) ──────────────────
+    # -- 3. Wind (linear ramp 30->100 km/h maps to 0->10 pts) ----------------
     wind = req.wind_speed_kmh
     if wind > 30:
         score += min(((wind - 30) / 70.0) * 10.0, 10.0)
 
-    # ── 4. Slope (bonus for steep hills) ─────────────────────────────────────
+    # -- 4. Slope (bonus for steep hills) -------------------------------------
     if abs(seg.slope_percent) > 10:
         score += 5.0
 
@@ -123,17 +129,12 @@ def _look_ahead(seg: _Seg, req) -> float:
     return 300.0
 
 
-# ── Cluster counter ───────────────────────────────────────────────────────────
+# -- Cluster counter ----------------------------------------------------------
 
 def assign_cluster_counts(segments: list[_Seg]) -> list[_Seg]:
     """
     Linear post-pass. Counts how many consecutive sharp/hairpin segments
     end at (and include) each segment.
-
-    Example:
-        [none, sharp, hairpin, sharp, none, sharp]
-         run:   1       2        3      0     1
-    Segments with consecutiveSharpCount ≥ 3 → isHairpinCluster = true in Flutter.
     """
     run = 0
     for seg in segments:
@@ -145,11 +146,17 @@ def assign_cluster_counts(segments: list[_Seg]) -> list[_Seg]:
     return segments
 
 
-# ── BendCategory classifier ───────────────────────────────────────────────────
+# -- BendCategory classifier --------------------------------------------------
 
 def category_from_angle(angle: float) -> BendCategory:
-    if angle >= 120: return BendCategory.hairpin
-    if angle >= 75:  return BendCategory.sharp
-    if angle >= 45:  return BendCategory.moderate
-    if angle >= 15:  return BendCategory.gentle
+    """Calibrated for mountain driving risk perception:
+      hairpin  >= 100 degrees  (was 120)
+      sharp    >=  60 degrees  (was  75) -- 66 deg IS a sharp mountain turn!
+      moderate >=  30 degrees  (was  45)
+      gentle   >=  10 degrees  (was  15)
+    """
+    if angle >= 100: return BendCategory.hairpin
+    if angle >=  60: return BendCategory.sharp
+    if angle >=  30: return BendCategory.moderate
+    if angle >=  10: return BendCategory.gentle
     return BendCategory.none
