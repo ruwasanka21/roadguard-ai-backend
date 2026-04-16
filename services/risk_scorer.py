@@ -150,11 +150,11 @@ def assign_cluster_counts(segments: list[_Seg]) -> list[_Seg]:
 # -- BendCategory classifier --------------------------------------------------
 
 def category_from_angle(angle: float) -> BendCategory:
-    """Calibrated for mountain driving risk perception:
-      hairpin  >= 100 degrees  (was 120)
-      sharp    >=  60 degrees  (was  75) -- 66 deg IS a sharp mountain turn!
-      moderate >=  30 degrees  (was  45)
-      gentle   >=  10 degrees  (was  15)
+    """Calibrated per user specification:
+      hairpin  >= 85 degrees
+      sharp    >= 55 degrees
+      moderate >= 35 degrees
+      gentle   >= 20 degrees
     """
     if angle >= 85: return BendCategory.hairpin
     if angle >= 55: return BendCategory.sharp
