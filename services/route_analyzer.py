@@ -42,10 +42,11 @@ from services.risk_scorer import (
 
 logger = logging.getLogger(__name__)
 
-TARGET_SEG_DIST_M = 300.0  # aim for ~300 m of road per segment
-MIN_SEG_EDGES     = 4      # minimum edges per segment — ensures enough geometry to measure a turn
+TARGET_SEG_DIST_M = 150.0  # aim for ~150 m of road per segment (tighter = fewer missed bends)
+MIN_SEG_EDGES     = 2      # allow as few as 2 edges for dense urban polylines
 SG_WINDOW         = 3      # Savitzky-Golay smoother window (minimal, sparse-friendly)
 SHARP_THRESH      = 45.0   # degrees → is_sharp_turn = True (counts moderate bends and above)
+RAW_STEP_WEIGHT   = 1.2    # amplify raw single-step peaks to compensate for smoother softening
 
 
 class RouteAnalyzerService:
@@ -92,7 +93,7 @@ class RouteAnalyzerService:
             n, avg_spacing, N_PTS, HALF_WIN,
         )
 
-        raw_segments = _build_segments(lats, lngs, smooth, edge_dists,
+        raw_segments = _build_segments(lats, lngs, smooth, raw_bearings, edge_dists,
                                        N_PTS, HALF_WIN)
         logger.info("Built %d raw segments from %d GPS points", len(raw_segments), n)
 
@@ -115,12 +116,13 @@ class RouteAnalyzerService:
 # ── Adaptive point-count segmentation ────────────────────────────────────────
 
 def _build_segments(
-    lats:       np.ndarray,
-    lngs:       np.ndarray,
-    smooth:     np.ndarray,  # shape (n-1,)
-    edge_dists: np.ndarray,  # shape (n-1,)
-    N_PTS:      int,
-    HALF_WIN:   int,
+    lats:         np.ndarray,
+    lngs:         np.ndarray,
+    smooth:       np.ndarray,  # shape (n-1,) — SG-smoothed bearings
+    raw_bearings: np.ndarray,  # shape (n-1,) — unsmoothed bearings (for step scan)
+    edge_dists:   np.ndarray,  # shape (n-1,)
+    N_PTS:        int,
+    HALF_WIN:     int,
 ) -> List[_Seg]:
     """
     Cut the polyline into segments of N_PTS GPS edges.
@@ -156,7 +158,7 @@ def _build_segments(
         else:
             entry_exit = 0.0
 
-        # ── Sliding-window: scan ±HALF_WIN around each edge index ─────────────
+        # ── Sliding-window on smoothed bearings (catches gradual bends) ───────
         sw_peak = entry_exit
         for mid in range(b_lo, b_hi + 1):
             lo = max(mid - HALF_WIN, 0)
@@ -166,7 +168,20 @@ def _build_segments(
                 if d > sw_peak:
                     sw_peak = d
 
-        peak_delta = sw_peak
+        # ── Raw consecutive-pair step scan (catches sparse single-edge bends) ─
+        #   The SG smoother softens a real 60° bend at one GPS edge to ~30°.
+        #   Raw edge-to-edge bearing deltas bypass the smoother completely and
+        #   recover the true instantaneous bend at each GPS corner point.
+        raw_step_peak = 0.0
+        for k in range(b_lo, b_hi):
+            if k + 1 < len(raw_bearings):
+                d = float(bearing_delta(raw_bearings[k], raw_bearings[k + 1]))
+                if d > raw_step_peak:
+                    raw_step_peak = d
+        # Slightly amplify to compensate for residual smoother softening
+        raw_step_peak = min(raw_step_peak * RAW_STEP_WEIGHT, 180.0)
+
+        peak_delta = max(entry_exit, sw_peak, raw_step_peak)
         cat        = category_from_angle(peak_delta)
 
         segments.append(_Seg(
