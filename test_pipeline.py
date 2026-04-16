@@ -167,6 +167,46 @@ async def test_full_pipeline():
     print(f"  full pipeline: {len(segments)} seg(s), categories={cats}, sharp={has_sharp}  {PASS}")
 
 
+async def test_sparse_polyline_hairpin():
+    """
+    Simulates a LONG MOUNTAIN ROUTE with sparse GPS points (~200 m apart).
+    This is the exact case that was broken: MAX_SEG_DIST=300m was cutting
+    segments after only 1-2 points, preventing any meaningful bend detection.
+
+    3 hairpins injected into a long straight route.
+    Expects at least 2 sharp/hairpin segments to be detected.
+    """
+    from models.request import AnalyzeRequest, GeoPoint
+    from services.route_analyzer import RouteAnalyzerService
+    import math
+
+    pts = []
+    lat, lng = 7.00, 80.60
+
+    for _ in range(3):
+        # Straight section (sparse, ~220m per point)
+        for j in range(5):
+            pts.append(GeoPoint(lat=lat, lng=lng))
+            lat += 0.002
+        # Hairpin: sweep 150° across 6 tight points
+        for step in range(6):
+            angle = math.radians(step * 25)
+            pts.append(GeoPoint(lat=lat + math.sin(angle)*0.0005,
+                                lng=lng + math.cos(angle)*0.0005))
+        lat += 0.002
+
+    req = AnalyzeRequest(
+        polyline=pts, weather_condition="clear",
+        wind_speed_kmh=0, visibility_m=10000,
+        precip_mm_per_hour=0, temperature_c=25,
+    )
+    segments = await RouteAnalyzerService.analyze(req)
+    sharp_count = sum(1 for s in segments if s.bend_category in ("sharp", "hairpin"))
+    cats = [s.bend_category for s in segments]
+    assert sharp_count >= 2, f"Expected >=2 sharp, got {sharp_count}. cats={cats}"
+    print(f"  sparse polyline (3 hairpins): {len(segments)} seg(s), sharp={sharp_count}  {PASS}")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -195,6 +235,12 @@ if __name__ == "__main__":
     except Exception as e:
         errors.append(f"test_full_pipeline: {e}")
         print(f"  test_full_pipeline  {FAIL}: {e}")
+
+    try:
+        asyncio.run(test_sparse_polyline_hairpin())
+    except Exception as e:
+        errors.append(f"test_sparse_polyline_hairpin: {e}")
+        print(f"  test_sparse_polyline_hairpin  {FAIL}: {e}")
 
     print()
     if errors:
