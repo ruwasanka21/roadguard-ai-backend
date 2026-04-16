@@ -43,9 +43,9 @@ from services.risk_scorer import (
 logger = logging.getLogger(__name__)
 
 TARGET_SEG_DIST_M = 300.0  # aim for ~300 m of road per segment
-MIN_SEG_EDGES     = 2      # never flush a segment with fewer edges than this
+MIN_SEG_EDGES     = 4      # minimum edges per segment — ensures enough geometry to measure a turn
 SG_WINDOW         = 3      # Savitzky-Golay smoother window (minimal, sparse-friendly)
-SHARP_THRESH      = 60.0   # degrees → is_sharp_turn = True
+SHARP_THRESH      = 45.0   # degrees → is_sharp_turn = True (counts moderate bends and above)
 
 
 class RouteAnalyzerService:
@@ -80,11 +80,12 @@ class RouteAnalyzerService:
 
         # N_PTS: how many GPS edges per segment
         # Dense (15m/pt)  → N_PTS = 300/15 = 20
-        # Sparse (200m/pt) → N_PTS = max(2, 300/200) = 2
-        N_PTS = max(MIN_SEG_EDGES, int(round(TARGET_SEG_DIST_M / avg_spacing)))
+        # Sparse (300m/pt) → N_PTS = max(4, 300/300) = 4    ← minimum floor prevents collapse
+        # Very sparse (2km/pt) → N_PTS = 4 (floor kicks in)
+        N_PTS = max(MIN_SEG_EDGES, min(25, int(round(TARGET_SEG_DIST_M / avg_spacing))))
 
-        # Sliding window ±HALF_WIN: covers roughly ±TARGET_SEG_DIST_M / 2
-        HALF_WIN = max(2, N_PTS // 2)
+        # Sliding window ±HALF_WIN: covers at least ±4 points for short segments
+        HALF_WIN = max(4, N_PTS // 2)
 
         logger.info(
             "Polyline: %d pts, avg_spacing=%.1f m → N_PTS=%d, HALF_WIN=%d",
