@@ -100,8 +100,7 @@ class RouteAnalyzerService:
         )
         logger.info("Direction-grouping → %d segments", len(raw_segments))
 
-        # ── Stage 4: sliding-window peak scan (boost under-detected bends) ────
-        _boost_with_scan_window(raw_segments, raw_b, seg_edge_ranges)
+        # ── Stage 4: (Boost pass removed — direction-grouping alone is exact) ────
 
         # ── Stage 5: elevation → slope ─────────────────────────────────────────
         seg_pts = [(s.start_lat, s.start_lng) for s in raw_segments]
@@ -240,43 +239,6 @@ def _group_by_direction_tolerant(
     return segments, edge_ranges
 
 
-# ── Secondary: sliding-window peak boost ─────────────────────────────────────
-
-def _boost_with_scan_window(
-    segments:    List[_Seg],
-    raw_b:       np.ndarray,
-    edge_ranges: List[tuple],
-) -> None:
-    """
-    For every segment, compute the maximum raw-delta sum across a window that
-    extends ±SCAN_WIN edges beyond the segment's ACTUAL edge range.
-    This catches single-edge sharp corners that direction-grouping partly absorbed.
-    edge_ranges[i] = (start_edge, end_edge) indices into raw_b.
-    """
-    if len(raw_b) < 2:
-        return
-
-    # Precompute absolute single-step bearing changes at each edge boundary
-    raw_abs = np.array([
-        float(bearing_delta(raw_b[k], raw_b[k + 1]))
-        for k in range(len(raw_b) - 1)
-    ])
-
-    for seg, (start_edge, end_edge) in zip(segments, edge_ranges):
-        # Extend ±SCAN_WIN beyond the segment's actual edge span
-        lo = max(0, start_edge - SCAN_WIN)
-        hi = min(len(raw_abs), end_edge + SCAN_WIN + 1)  # +1: slice is exclusive
-
-        if hi > lo:
-            scan_peak = float(np.sum(raw_abs[lo:hi]))
-        else:
-            scan_peak = 0.0
-
-        # Only upgrade, never downgrade
-        if scan_peak > seg.bearing_change:
-            seg.bearing_change = round(scan_peak, 2)
-            seg.bend_category  = category_from_angle(seg.bearing_change)
-            seg.is_sharp_turn  = seg.bearing_change >= SHARP_THRESH
 
 
 # ── Response serialiser ────────────────────────────────────────────────────────
