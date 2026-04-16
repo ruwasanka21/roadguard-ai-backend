@@ -153,6 +153,7 @@ def _group_by_direction_tolerant(
             return
         start_edge = seg_start          # edge i goes from lats[i] → lats[i+1]
         end_edge   = end_pt - 1        # last edge ending at end_pt
+        dir_str    = "right" if cur_dir == 1 else "left" if cur_dir == -1 else "straight"
         segments.append(_Seg(
             segment_index           = len(segments),
             start_lat               = float(lats[seg_start]),
@@ -160,6 +161,7 @@ def _group_by_direction_tolerant(
             end_lat                 = float(lats[end_pt]),
             end_lng                 = float(lngs[end_pt]),
             bearing_change          = round(acc_turn, 2),
+            turn_direction          = dir_str,
             is_sharp_turn           = acc_turn >= SHARP_THRESH,
             bend_category           = category_from_angle(acc_turn),
             consecutive_sharp_count = 0,
@@ -225,8 +227,8 @@ def _group_by_direction_tolerant(
             segment_index=0,
             start_lat=float(lats[0]),  start_lng=float(lngs[0]),
             end_lat=float(lats[-1]),   end_lng=float(lngs[-1]),
-            bearing_change=0.0,        is_sharp_turn=False,
-            bend_category=category_from_angle(0.0),
+            bearing_change=0.0,        turn_direction="straight",
+            is_sharp_turn=False,       bend_category=category_from_angle(0.0),
             consecutive_sharp_count=0, look_ahead_meters=300.0,
             distance_meters=round(float(edge_dists.sum()), 1),
             slope_percent=0.0,
@@ -288,6 +290,7 @@ def _to_response(segments: List[_Seg]) -> List[SegmentResponse]:
             end_lat                 = s.end_lat,
             end_lng                 = s.end_lng,
             bearing_change          = s.bearing_change,
+            turn_direction          = s.turn_direction,
             is_sharp_turn           = s.is_sharp_turn,
             bend_category           = s.bend_category,
             consecutive_sharp_count = s.consecutive_sharp_count,

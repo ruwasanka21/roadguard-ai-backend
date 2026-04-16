@@ -79,7 +79,7 @@ def test_cluster_multiplier():
 
     segs = [
         _Seg(i, 7.0 + i*0.001, 80.0, 7.0+i*0.002, 80.001,
-             bearing_change=130.0, is_sharp_turn=True,
+             bearing_change=130.0, turn_direction="right", is_sharp_turn=True,
              bend_category=BendCategory.hairpin,
              consecutive_sharp_count=0, look_ahead_meters=300,
              distance_meters=150, slope_percent=0)
@@ -105,7 +105,7 @@ def test_risk_classification():
         is_foggy           = False
 
     seg = _Seg(0, 7.0, 80.0, 7.01, 80.01,
-               bearing_change=130.0, is_sharp_turn=True,
+               bearing_change=130.0, turn_direction="right", is_sharp_turn=True,
                bend_category=BendCategory.hairpin,
                consecutive_sharp_count=0, look_ahead_meters=300,
                distance_meters=200, slope_percent=12.0)

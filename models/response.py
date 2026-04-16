@@ -25,6 +25,7 @@ class SegmentResponse(BaseModel):
     end_lat:                 float
     end_lng:                 float
     bearing_change:          float   # peak bearing delta in degrees (0–180)
+    turn_direction:          str     # "left", "right", or "straight"
     is_sharp_turn:           bool
     bend_category:           BendCategory
     consecutive_sharp_count: int

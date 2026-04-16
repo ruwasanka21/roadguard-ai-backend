@@ -50,6 +50,7 @@ class _Seg:
     end_lat:                 float
     end_lng:                 float
     bearing_change:          float
+    turn_direction:          str
     is_sharp_turn:           bool
     bend_category:           BendCategory
     consecutive_sharp_count: int
