@@ -1,22 +1,34 @@
 """
-Route Analyzer — main pipeline orchestrator.
+Route Analyzer — completely rebuilt pipeline.
 
-Pipeline stages:
-  1. Compute raw edge bearings          (NumPy vectorised)
-  2. Savitzky-Golay bearing smoother    (SciPy — better peak preservation)
-  3. Adaptive segmentation              (150 m in curves, 250 m on straights)
-  4. Local-peak bearing delta           (O(n) single scan per segment)
-  5. BendCategory classification
-  6. Elevation fetch → real slope %     (async Google Elevation API)
-  7. Risk scoring + cluster counting
+ROOT CAUSE OF PREVIOUS FAILURE:
+  Google Directions polylines for long routes are highly compressed — one GPS
+  point can be placed every 100–300 m. With the old 250 m distance-based
+  segmentation, each segment contained only 1-2 points. Measuring the max
+  single-step bearing change of 1-2 points meant a real 130° hairpin that
+  is spread across 8 GPS points was always seen as multiple tiny 15° steps,
+  every one of which was classified as "Gentle / Low Risk".
+
+NEW APPROACH  (point-count based segmentation + entry-exit bearing):
+  1. Segment by GPS-POINT COUNT (every N_PTS points), not by distance.
+     This adapts automatically to sparse & dense polylines alike.
+  2. Measure bend severity as bearing_delta(entry_bearing, exit_bearing),
+     i.e. total road-direction change across the segment.
+     A hairpin across 8 GPS points now reads as ~120°, not 15°.
+  3. Secondary SLIDING-WINDOW scan: for every GPS point, also compute the
+     bearing change over a ±HALF_WIN window. Use whichever is larger.
+     This catches sharp single-apex bends that the segment method might
+     straddle across two segment boundaries.
+  4. Keep the Savitzky-Golay smoother but with a smaller window (3) to
+     reduce over-smoothing on sparse polylines.
 """
 import numpy as np
 import logging
-from typing  import List
+from typing import List
 
 from models.request  import AnalyzeRequest
 from models.response import SegmentResponse
-from services.geometry  import (
+from services.geometry import (
     haversine_meters,
     bearing_deg,
     bearing_delta,
@@ -33,10 +45,13 @@ from services.risk_scorer import (
 
 logger = logging.getLogger(__name__)
 
-# ── Segmentation constants ────────────────────────────────────────────────────
-DEFAULT_SEG_LEN   = 250.0   # metres — straight / gentle road
-CURVE_SEG_LEN     = 150.0   # metres — tight curves (keeps hairpin in one segment)
-CURVE_ANGLE_THRESH = 45.0   # accumulated degrees that triggers shorter segments
+# ── Tuning constants ──────────────────────────────────────────────────────────
+N_PTS          = 6      # GPS points per segment (adapts to polyline density)
+MIN_SEG_PTS    = 2      # never cut a segment shorter than this many points
+MAX_SEG_DIST   = 300.0  # hard-cap in metres (prevents huge straight segments)
+SG_WINDOW      = 3      # Savitzky-Golay window — 3 is minimal but avoids oversmoothing
+HALF_WIN       = 4      # ± half-window for sliding-window scan in points
+SHARP_THRESH   = 60.0   # bearing change (°) to flag is_sharp_turn
 
 
 class RouteAnalyzerService:
@@ -44,139 +59,133 @@ class RouteAnalyzerService:
     @staticmethod
     async def analyze(req: AnalyzeRequest) -> List[SegmentResponse]:
 
-        # ── Convert to NumPy arrays for bulk operations ───────────────────────
         lats = np.array([p.lat for p in req.polyline])
         lngs = np.array([p.lng for p in req.polyline])
         n    = len(lats)
 
-        # ── Stage 1: Compute raw edge bearings ───────────────────────────────
-        #   One bearing per GPS edge: shape (n-1,)
+        # ── Stage 1: raw edge bearings  (shape n-1) ───────────────────────────
         raw_bearings = bearing_deg(lats[:-1], lngs[:-1], lats[1:], lngs[1:])
-        logger.debug("Raw bearings computed: %d edges", len(raw_bearings))
+        logger.debug("Raw bearings: %d edges", len(raw_bearings))
 
-        # ── Stage 2: Savitzky-Golay smoother ─────────────────────────────────
-        #   window=5, polyorder=2 → removes GPS jitter while keeping peak sharpness
-        #   Falls back to raw if polyline is too short for the window
-        if len(raw_bearings) >= 5:
-            smooth = smooth_bearings_savgol(raw_bearings, window=5, polyorder=2)
+        # ── Stage 2: gentle SG smoothing (window=3, removes GPS jitter only) ─
+        if len(raw_bearings) >= SG_WINDOW:
+            smooth = smooth_bearings_savgol(raw_bearings,
+                                            window=SG_WINDOW, polyorder=1)
         else:
             smooth = raw_bearings.copy()
-        logger.debug("Bearings smoothed with Savitzky-Golay")
 
-        # ── Precompute edge distances (vectorised Haversine) ──────────────────
+        # ── Stage 3: edge distances ────────────────────────────────────────────
         edge_dists = haversine_meters(lats[:-1], lngs[:-1], lats[1:], lngs[1:])
 
-        # ── Stage 3 + 4 + 5: Adaptive segmentation + local-peak + classify ───
-        raw_segments = _build_segments(lats, lngs, smooth, edge_dists)
-        logger.info("Built %d raw segments", len(raw_segments))
+        # ── Stage 4: point-count-based segmentation ───────────────────────────
+        raw_segments = _build_segments(lats, lngs, smooth, edge_dists, n)
+        logger.info("Built %d raw segments from %d GPS points", len(raw_segments), n)
 
-        # ── Stage 6: Fetch real elevation → convert to slope % ───────────────
-        #   Query start-of-each-segment + end-of-last-segment
+        # ── Stage 5: elevation → slope ────────────────────────────────────────
         seg_points = [(s.start_lat, s.start_lng) for s in raw_segments]
-        last = raw_segments[-1]
-        seg_points.append((last.end_lat, last.end_lng))
-
+        seg_points.append((raw_segments[-1].end_lat, raw_segments[-1].end_lng))
         elevations = await fetch_elevations(seg_points)
-        distances  = [s.distance_meters for s in raw_segments]
-        slopes     = compute_slopes(elevations, distances)
-
+        slopes     = compute_slopes(elevations, [s.distance_meters for s in raw_segments])
         for seg, slope in zip(raw_segments, slopes):
             seg.slope_percent = slope
-        logger.debug("Elevation & slope data attached")
 
-        # ── Stage 7a: Cluster counting ────────────────────────────────────────
+        # ── Stage 6: cluster counter + risk scorer ────────────────────────────
         raw_segments = assign_cluster_counts(raw_segments)
-
-        # ── Stage 7b: Risk scoring ─────────────────────────────────────────────
-        scored = score_segments(raw_segments, req)
+        scored       = score_segments(raw_segments, req)
         logger.info("Scoring complete — %d segments", len(scored))
 
         return _to_response(scored)
 
 
-# ── Adaptive segmentation ─────────────────────────────────────────────────────
+# ── Point-count segmentation ──────────────────────────────────────────────────
 
 def _build_segments(
     lats:       np.ndarray,
     lngs:       np.ndarray,
     smooth:     np.ndarray,
     edge_dists: np.ndarray,
+    n:          int,
 ) -> List[_Seg]:
     """
-    Walk the polyline, accumulating distance and turning angle.
-    Cut a new segment when:
-      - accumulated distance ≥ 250 m  (straight / gentle)
-      - accumulated distance ≥ 150 m  AND accumulated angle > 45° (curve)
-      - last point reached
+    Walk polyline, cutting a new segment every N_PTS GPS points (or when
+    MAX_SEG_DIST metres are accumulated, whichever comes first).
+
+    Bend severity uses ENTRY-vs-EXIT bearing across the whole segment:
+        peak_delta = bearing_delta(smooth[seg_start], smooth[i-1])
+
+    This works correctly regardless of polyline density because it measures
+    the TOTAL direction change — not the max of tiny individual steps.
+
+    Additionally, a ±HALF_WIN sliding-window scan is compared and the
+    larger of the two values is used so single-apex bends on segment
+    boundaries are never missed.
     """
     segments:  List[_Seg] = []
     seg_start: int        = 0
     acc_dist:  float      = 0.0
-    acc_angle: float      = 0.0
+    pt_count:  int        = 0
 
-    for i in range(1, len(lats)):
-        acc_dist  += float(edge_dists[i - 1])
+    def _flush(end_idx: int):
+        nonlocal seg_start, acc_dist, pt_count
+        if end_idx <= seg_start:
+            return
 
-        # Accumulate turning angle from consecutive smoothed bearings
-        if i < len(smooth):
-            acc_angle += float(bearing_delta(smooth[i - 1], smooth[i]))
+        # ── Entry-vs-exit total bearing change ─────────────────────────────
+        b_start = int(min(seg_start,     len(smooth) - 1))
+        b_end   = int(min(end_idx - 1,   len(smooth) - 1))
+        entry_exit_delta = float(bearing_delta(smooth[b_start], smooth[b_end]))
 
-        # Adaptive boundary length
-        effective_len = CURVE_SEG_LEN if acc_angle > CURVE_ANGLE_THRESH else DEFAULT_SEG_LEN
-        is_last       = (i == len(lats) - 1)
+        # ── Sliding-window scan within this segment (catches apex on edge) ─
+        sw_peak = 0.0
+        for mid in range(b_start, b_end + 1):
+            lo = max(mid - HALF_WIN, 0)
+            hi = min(mid + HALF_WIN, len(smooth) - 1)
+            if hi > lo:
+                d = float(bearing_delta(smooth[lo], smooth[hi]))
+                if d > sw_peak:
+                    sw_peak = d
 
-        if acc_dist >= effective_len or is_last:
-            # ── Local-peak continuous turn detection ───────────────────────────
-            #   Instead of checking the angle of exactly two adjacent points,
-            #   accumulate the turning angle while the road keeps turning in
-            #   the same direction. This correctly captures hairpins spread over
-            #   multiple smaller GPS coordinates.
-            from_idx = max(seg_start - 1, 0)
-            to_idx   = min(i, len(smooth) - 1)
+        peak_delta = max(entry_exit_delta, sw_peak)
+        cat = category_from_angle(peak_delta)
 
-            peak_delta   = 0.0
-            current_turn = 0.0
-            current_sign = 0
+        seg_dist = max(acc_dist, 0.1)
+        segments.append(_Seg(
+            segment_index           = len(segments),
+            start_lat               = float(lats[seg_start]),
+            start_lng               = float(lngs[seg_start]),
+            end_lat                 = float(lats[end_idx]),
+            end_lng                 = float(lngs[end_idx]),
+            bearing_change          = round(peak_delta, 2),
+            is_sharp_turn           = peak_delta >= SHARP_THRESH,
+            bend_category           = cat,
+            consecutive_sharp_count = 0,
+            look_ahead_meters       = 300.0,
+            distance_meters         = round(seg_dist, 1),
+            slope_percent           = 0.0,
+        ))
+        seg_start = end_idx
+        acc_dist  = 0.0
+        pt_count  = 0
 
-            for k in range(from_idx, to_idx):
-                d = float(signed_bearing_delta(smooth[k], smooth[k + 1]))
-                sign = 1 if d > 0 else -1 if d < 0 else 0
-                
-                # If turning in same direction, accumulate the turn size
-                if sign == current_sign or current_sign == 0:
-                    current_turn += d
-                else:
-                    # Direction flipped (snaking road). Save peak and start new.
-                    if abs(current_turn) > peak_delta:
-                        peak_delta = abs(current_turn)
-                    current_turn = d
-                
-                if sign != 0:
-                    current_sign = sign
+    for i in range(1, n):
+        acc_dist += float(edge_dists[i - 1])
+        pt_count += 1
 
-            if abs(current_turn) > peak_delta:
-                peak_delta = abs(current_turn)
+        is_last     = (i == n - 1)
+        hit_pts     = (pt_count >= N_PTS)
+        hit_dist    = (acc_dist >= MAX_SEG_DIST)
 
-            cat = category_from_angle(peak_delta)
-
-            segments.append(_Seg(
-                segment_index           = len(segments),
-                start_lat               = float(lats[seg_start]),
-                start_lng               = float(lngs[seg_start]),
-                end_lat                 = float(lats[i]),
-                end_lng                 = float(lngs[i]),
-                bearing_change          = round(peak_delta, 2),
-                is_sharp_turn           = peak_delta > 60.0,
-                bend_category           = cat,
-                consecutive_sharp_count = 0,       # filled by cluster counter
-                look_ahead_meters       = 300.0,   # overwritten by scorer
-                distance_meters         = round(acc_dist, 1),
-                slope_percent           = 0.0,     # overwritten by elevation step
-            ))
-
-            seg_start = i
-            acc_dist  = 0.0
-            acc_angle = 0.0
+        if (hit_pts or hit_dist or is_last) and pt_count >= MIN_SEG_PTS:
+            _flush(i)
+        elif is_last and pt_count < MIN_SEG_PTS:
+            # Merge tiny tail into previous segment or flush as-is
+            if segments:
+                prev = segments[-1]
+                prev.end_lat = float(lats[i])
+                prev.end_lng = float(lngs[i])
+                prev.distance_meters = round(prev.distance_meters + acc_dist, 1)
+            else:
+                _flush(i)
 
     return segments
 
