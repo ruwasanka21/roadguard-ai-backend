@@ -24,6 +24,7 @@ class SegmentResponse(BaseModel):
     start_lng:               float
     end_lat:                 float
     end_lng:                 float
+    points:                  List[dict]  # list of {"lat": float, "lng": float}
     bearing_change:          float   # peak bearing delta in degrees (0–180)
     turn_direction:          str     # "left", "right", or "straight"
     is_sharp_turn:           bool

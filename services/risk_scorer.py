@@ -49,6 +49,7 @@ class _Seg:
     start_lng:               float
     end_lat:                 float
     end_lng:                 float
+    points:                  list[dict]
     bearing_change:          float
     turn_direction:          str
     is_sharp_turn:           bool
