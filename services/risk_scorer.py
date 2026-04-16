@@ -33,10 +33,10 @@ from models.response import BendCategory, RiskLevel, SegmentResponse
 
 _BEND_SCORE: dict[BendCategory, float] = {
     BendCategory.none:     0.0,
-    BendCategory.gentle:   10.0,  # slight curve  -> Low alone, Medium in bad weather
-    BendCategory.moderate: 25.0,  # 30-60 deg     -> Medium alone
-    BendCategory.sharp:    50.0,  # 60-100 deg    -> High alone
-    BendCategory.hairpin:  70.0,  # >100 deg      -> High alone (well above threshold)
+    BendCategory.gentle:   10.0,  # 20-35 deg  -> Low
+    BendCategory.moderate: 25.0,  # 35-55 deg  -> Medium
+    BendCategory.sharp:    50.0,  # 55-85 deg  -> High
+    BendCategory.hairpin:  75.0,  # 85+ deg    -> Very High
 }
 
 
@@ -155,8 +155,8 @@ def category_from_angle(angle: float) -> BendCategory:
       moderate >=  30 degrees  (was  45)
       gentle   >=  10 degrees  (was  15)
     """
-    if angle >= 100: return BendCategory.hairpin
-    if angle >=  60: return BendCategory.sharp
-    if angle >=  30: return BendCategory.moderate
-    if angle >=  10: return BendCategory.gentle
+    if angle >= 85: return BendCategory.hairpin
+    if angle >= 55: return BendCategory.sharp
+    if angle >= 35: return BendCategory.moderate
+    if angle >= 20: return BendCategory.gentle
     return BendCategory.none

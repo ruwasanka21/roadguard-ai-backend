@@ -47,19 +47,22 @@ def test_signed_bearing_delta():
 
 def test_bend_score():
     from services.risk_scorer import _BEND_SCORE, BendCategory
-    assert _BEND_SCORE[BendCategory.hairpin] == 70.0
-    assert _BEND_SCORE[BendCategory.none]    == 0.0
-    assert _BEND_SCORE[BendCategory.sharp]   == 50.0
+    assert _BEND_SCORE[BendCategory.hairpin]  == 75.0
+    assert _BEND_SCORE[BendCategory.sharp]    == 50.0
+    assert _BEND_SCORE[BendCategory.moderate] == 25.0
+    assert _BEND_SCORE[BendCategory.gentle]   == 10.0
+    assert _BEND_SCORE[BendCategory.none]     == 0.0
     print(f"  bend score lookup  {PASS}")
 
 
 def test_category_from_angle():
     from services.risk_scorer import category_from_angle, BendCategory
-    assert category_from_angle(5)   == BendCategory.none
-    assert category_from_angle(20)  == BendCategory.gentle
-    assert category_from_angle(45)  == BendCategory.moderate
-    assert category_from_angle(75)  == BendCategory.sharp
-    assert category_from_angle(105) == BendCategory.hairpin
+    # Exact boundaries from user-specified calibration table
+    assert category_from_angle(10)  == BendCategory.none      # 0-20 = drift/none
+    assert category_from_angle(25)  == BendCategory.gentle    # 20-35
+    assert category_from_angle(45)  == BendCategory.moderate  # 35-55
+    assert category_from_angle(70)  == BendCategory.sharp     # 55-85
+    assert category_from_angle(90)  == BendCategory.hairpin   # 85+
     print(f"  category_from_angle  {PASS}")
 
 
@@ -85,7 +88,7 @@ def test_cluster_multiplier():
     segs = assign_cluster_counts(segs)
     assert segs[2].consecutive_sharp_count == 3
     segs = score_segments(segs, FakeReq())
-    # hairpin(70) * 1.3 = 91 -> capped at 80; no weather/wind/slope -> score=80
+    # hairpin(75) * 1.3 = 97.5 -> capped at 80; no weather/wind/slope -> score=80
     assert segs[2].risk_score == 80.0, f"Expected 80.0, got {segs[2].risk_score}"
     print(f"  cluster multiplier (cap at 80)  {PASS}")
 
