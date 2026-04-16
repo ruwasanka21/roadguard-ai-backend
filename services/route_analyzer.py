@@ -95,13 +95,13 @@ class RouteAnalyzerService:
                     n, n_edges, len(deltas))
 
         # ── Stage 3: direction-grouping with reversal tolerance ───────────────
-        raw_segments = _group_by_direction_tolerant(
+        raw_segments, seg_edge_ranges = _group_by_direction_tolerant(
             lats, lngs, raw_b, edge_dists, deltas
         )
         logger.info("Direction-grouping → %d segments", len(raw_segments))
 
         # ── Stage 4: sliding-window peak scan (boost under-detected bends) ────
-        _boost_with_scan_window(raw_segments, raw_b)
+        _boost_with_scan_window(raw_segments, raw_b, seg_edge_ranges)
 
         # ── Stage 5: elevation → slope ─────────────────────────────────────────
         seg_pts = [(s.start_lat, s.start_lng) for s in raw_segments]
@@ -128,14 +128,18 @@ def _group_by_direction_tolerant(
     raw_b:      np.ndarray,
     edge_dists: np.ndarray,
     deltas:     np.ndarray,
-) -> List[_Seg]:
+):
     """
     Walk the polyline. Group consecutive edges that turn in the same direction.
     Small opposite-direction blips (< REVERSAL_TOLERANCE total) are absorbed
     without splitting the current group.
+
+    Returns (segments, edge_ranges) where edge_ranges[i] = (start_edge, end_edge)
+    are the RAW_B indices that belong to segment i.
     """
     n        = len(lats)
-    segments: List[_Seg] = []
+    segments:    List[_Seg]          = []
+    edge_ranges: List[tuple]         = []   # (start_edge, end_edge) per segment
 
     seg_start    = 0
     acc_turn     = 0.0   # total turn in the PRIMARY direction of this group
@@ -147,6 +151,8 @@ def _group_by_direction_tolerant(
         nonlocal seg_start, acc_turn, acc_dist, cur_dir, pending_opp
         if end_pt <= seg_start or acc_dist < MIN_SEG_M:
             return
+        start_edge = seg_start          # edge i goes from lats[i] → lats[i+1]
+        end_edge   = end_pt - 1        # last edge ending at end_pt
         segments.append(_Seg(
             segment_index           = len(segments),
             start_lat               = float(lats[seg_start]),
@@ -161,6 +167,7 @@ def _group_by_direction_tolerant(
             distance_meters         = round(acc_dist, 1),
             slope_percent           = 0.0,
         ))
+        edge_ranges.append((start_edge, end_edge))
         seg_start   = end_pt
         acc_turn    = 0.0
         acc_dist    = 0.0
@@ -228,46 +235,42 @@ def _group_by_direction_tolerant(
     for idx, s in enumerate(segments):
         s.segment_index = idx
 
-    return segments
+    return segments, edge_ranges
 
 
 # ── Secondary: sliding-window peak boost ─────────────────────────────────────
 
-def _boost_with_scan_window(segments: List[_Seg], raw_b: np.ndarray) -> None:
+def _boost_with_scan_window(
+    segments:    List[_Seg],
+    raw_b:       np.ndarray,
+    edge_ranges: List[tuple],
+) -> None:
     """
-    For every segment produced by direction-grouping, compute the maximum
-    TOTAL bearing change across any ±SCAN_WIN edge window that overlaps the
-    segment.  If this scan-peak > the group's accumulated turn, use the scan
-    value instead.
-
-    This catches localised sharp turns (e.g. a single GPS edge representing a
-    tight corner) whose instantaneous bearing jump was partly absorbed by the
-    reversal-tolerance logic.
+    For every segment, compute the maximum raw-delta sum across a window that
+    extends ±SCAN_WIN edges beyond the segment's ACTUAL edge range.
+    This catches single-edge sharp corners that direction-grouping partly absorbed.
+    edge_ranges[i] = (start_edge, end_edge) indices into raw_b.
     """
     if len(raw_b) < 2:
         return
 
-    # Precompute raw edge-to-edge deltas (absolute, not signed)
+    # Precompute absolute single-step bearing changes at each edge boundary
     raw_abs = np.array([
         float(bearing_delta(raw_b[k], raw_b[k + 1]))
         for k in range(len(raw_b) - 1)
     ])
 
-    # For each segment, find which raw_b indices it roughly spans
-    # We use edge index = segment_index as an approximation, extending ±SCAN_WIN
-    for seg in segments:
-        # Approximate centre edge of this segment
-        mid_edge = seg.segment_index
-
-        lo = max(0, mid_edge - SCAN_WIN)
-        hi = min(len(raw_abs) - 1, mid_edge + SCAN_WIN)
+    for seg, (start_edge, end_edge) in zip(segments, edge_ranges):
+        # Extend ±SCAN_WIN beyond the segment's actual edge span
+        lo = max(0, start_edge - SCAN_WIN)
+        hi = min(len(raw_abs), end_edge + SCAN_WIN + 1)  # +1: slice is exclusive
 
         if hi > lo:
-            scan_peak = float(np.sum(raw_abs[lo:hi + 1]))
+            scan_peak = float(np.sum(raw_abs[lo:hi]))
         else:
             scan_peak = 0.0
 
-        # Only upgrade, never downgrade (direction-grouping total is always valid)
+        # Only upgrade, never downgrade
         if scan_peak > seg.bearing_change:
             seg.bearing_change = round(scan_peak, 2)
             seg.bend_category  = category_from_angle(seg.bearing_change)

@@ -9,8 +9,8 @@ Score composition (0–100):
   slope           → 0–5 pts    (bonus when |slope| > 10 %)
 
 Classification:
-  score ≥ 65  → high
-  score ≥ 35  → medium
+  score ≥ 50  → high   (was 65 — sharp bend should count!)
+  score ≥ 25  → medium  (was 35 — a detected sharp bend in clear weather = medium)
   else        → low
 
 Dynamic look-ahead:
@@ -27,10 +27,10 @@ from models.response import BendCategory, RiskLevel, SegmentResponse
 
 _BEND_SCORE: dict[BendCategory, float] = {
     BendCategory.none:     0.0,
-    BendCategory.gentle:   5.0,
-    BendCategory.moderate: 15.0,
-    BendCategory.sharp:    30.0,
-    BendCategory.hairpin:  45.0,
+    BendCategory.gentle:   5.0,   # barely noticeable curve
+    BendCategory.moderate: 20.0,  # notable curve,  alone = Low, rain = Medium
+    BendCategory.sharp:    35.0,  # sharp bend,     alone = Medium
+    BendCategory.hairpin:  55.0,  # hairpin,        alone = High
 }
 
 
@@ -68,9 +68,9 @@ def _score(seg: _Seg, req) -> tuple[float, RiskLevel, float]:
     bend_pts = _BEND_SCORE[seg.bend_category]
 
     # Cluster multiplier: ≥ 3 consecutive sharp / hairpin segments → ×1.4
-    # Example: 3 consecutive hairpins → 45 × 1.4 = 63 pts (capped at 45)
+    # Cap raised to 65 so the multiplier is actually meaningful for all categories.
     if seg.consecutive_sharp_count >= 3:
-        bend_pts = min(bend_pts * 1.4, 45.0)
+        bend_pts = min(bend_pts * 1.4, 65.0)
 
     score += bend_pts
 
@@ -108,8 +108,8 @@ def _weather_score(req) -> float:
 
 
 def _classify(score: float) -> RiskLevel:
-    if score >= 65: return RiskLevel.high
-    if score >= 35: return RiskLevel.medium
+    if score >= 50: return RiskLevel.high
+    if score >= 25: return RiskLevel.medium
     return RiskLevel.low
 
 

@@ -47,9 +47,9 @@ def test_signed_bearing_delta():
 
 def test_bend_score():
     from services.risk_scorer import _BEND_SCORE, BendCategory
-    assert _BEND_SCORE[BendCategory.hairpin] == 45.0
+    assert _BEND_SCORE[BendCategory.hairpin] == 55.0
     assert _BEND_SCORE[BendCategory.none]    == 0.0
-    assert _BEND_SCORE[BendCategory.sharp]   == 30.0
+    assert _BEND_SCORE[BendCategory.sharp]   == 35.0
     print(f"  bend score lookup  {PASS}")
 
 
@@ -85,8 +85,8 @@ def test_cluster_multiplier():
     segs = assign_cluster_counts(segs)
     assert segs[2].consecutive_sharp_count == 3
     segs = score_segments(segs, FakeReq())
-    assert segs[2].risk_score == 45.0, f"Expected 45.0, got {segs[2].risk_score}"
-    print(f"  cluster multiplier (cap at 45)  {PASS}")
+    assert segs[2].risk_score == 65.0, f"Expected 65.0, got {segs[2].risk_score}"
+    print(f"  cluster multiplier (cap at 65)  {PASS}")
 
 
 def test_risk_classification():
