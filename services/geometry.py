@@ -63,6 +63,18 @@ def bearing_delta(b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
     return np.where(diff > 180.0, 360.0 - diff, diff)
 
 
+def signed_bearing_delta(b1: np.ndarray | float, b2: np.ndarray | float) -> np.ndarray | float:
+    """
+    Signed angular difference between two bearings in [-180°, 180°].
+    Positive values indicate a right turn, negative values indicate a left turn.
+    """
+    diff = (b2 - b1) % 360.0
+    if isinstance(diff, np.ndarray):
+        return np.where(diff > 180.0, diff - 360.0, diff)
+    return diff - 360.0 if diff > 180.0 else diff
+
+
+
 def smooth_bearings_savgol(bearings: np.ndarray, window: int = 5, polyorder: int = 2) -> np.ndarray:
     """
     Savitzky-Golay smoother applied in bearing-space.

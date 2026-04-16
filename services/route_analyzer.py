@@ -20,6 +20,7 @@ from services.geometry  import (
     haversine_meters,
     bearing_deg,
     bearing_delta,
+    signed_bearing_delta,
     smooth_bearings_savgol,
 )
 from services.elevation import fetch_elevations, compute_slopes
@@ -125,17 +126,36 @@ def _build_segments(
         is_last       = (i == len(lats) - 1)
 
         if acc_dist >= effective_len or is_last:
-            # ── Local-peak bearing delta (O(n) per window) ─────────────────
-            #   Scan only consecutive smoothed-bearing pairs inside this window.
-            #   Include the incoming edge (seg_start-1) to catch turns on boundary.
+            # ── Local-peak continuous turn detection ───────────────────────────
+            #   Instead of checking the angle of exactly two adjacent points,
+            #   accumulate the turning angle while the road keeps turning in
+            #   the same direction. This correctly captures hairpins spread over
+            #   multiple smaller GPS coordinates.
             from_idx = max(seg_start - 1, 0)
             to_idx   = min(i, len(smooth) - 1)
 
-            peak_delta = 0.0
+            peak_delta   = 0.0
+            current_turn = 0.0
+            current_sign = 0
+
             for k in range(from_idx, to_idx):
-                d = float(bearing_delta(smooth[k], smooth[k + 1]))
-                if d > peak_delta:
-                    peak_delta = d
+                d = float(signed_bearing_delta(smooth[k], smooth[k + 1]))
+                sign = 1 if d > 0 else -1 if d < 0 else 0
+                
+                # If turning in same direction, accumulate the turn size
+                if sign == current_sign or current_sign == 0:
+                    current_turn += d
+                else:
+                    # Direction flipped (snaking road). Save peak and start new.
+                    if abs(current_turn) > peak_delta:
+                        peak_delta = abs(current_turn)
+                    current_turn = d
+                
+                if sign != 0:
+                    current_sign = sign
+
+            if abs(current_turn) > peak_delta:
+                peak_delta = abs(current_turn)
 
             cat = category_from_angle(peak_delta)
 
