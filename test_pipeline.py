@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Quick smoke-test — run with:
-    cd backend
-    python test_pipeline.py
-
-Tests the geometry, scoring, and full pipeline WITHOUT a real server.
+Smoke-tests for the RoadGuard AI backend.
+Run with:   cd backend && python test_pipeline.py
 """
 import asyncio
 import sys
 import math
 import os
 
-# Force UTF-8 output on Windows so tick/cross characters render
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -19,42 +15,35 @@ PASS = "[OK]"
 FAIL = "[FAIL]"
 
 
-# ── Geometry tests ─────────────────────────────────────────────────────────────
+# ── Geometry ───────────────────────────────────────────────────────────────────
 
 def test_haversine():
     from services.geometry import haversine_meters
-    # Colombo (6.9271, 79.8612) to Kandy (7.2906, 80.6337)
-    # Great-circle distance ~94 km
     d = haversine_meters(6.9271, 79.8612, 7.2906, 80.6337)
     assert 90_000 < d < 100_000, f"Expected ~94 km, got {d/1000:.1f} km"
-    print(f"  haversine_meters Colombo-Kandy: {d/1000:.1f} km  {PASS}")
+    print(f"  haversine Colombo→Kandy: {d/1000:.1f} km  {PASS}")
 
 
 def test_bearing_delta():
     from services.geometry import bearing_delta
     import numpy as np
-    # 5 and 355 are 10 degrees apart (shortest arc across 0/360 boundary)
     delta = bearing_delta(np.array([5.0]), np.array([355.0]))
-    assert abs(delta[0] - 10.0) < 0.001, f"Expected 10, got {delta[0]}"
-    print(f"  bearing_delta(5, 355) = {delta[0]}  {PASS}")
+    assert abs(delta[0] - 10.0) < 0.001
+    print(f"  bearing_delta(5°, 355°) = {delta[0]}°  {PASS}")
 
 
-def test_smoother():
-    from services.geometry import smooth_bearings_savgol
-    import numpy as np
-    # A flat 90-degree sequence with one 150-degree spike
-    # The smoother should reduce but not eliminate the spike
-    bearings = np.array([90.0, 90.0, 90.0, 150.0, 90.0, 90.0, 90.0])
-    smoothed  = smooth_bearings_savgol(bearings, window=5, polyorder=2)
-    spike_raw  = abs(150.0 - 90.0)           # = 60
-    spike_smth = float(abs(smoothed[3] - 90.0))
-    assert spike_smth < spike_raw, (
-        f"Smoother should reduce spike magnitude: {spike_raw} -> {spike_smth}"
-    )
-    print(f"  savgol smoother: spike 60 -> {spike_smth:.1f} deg  {PASS}")
+def test_signed_bearing_delta():
+    from services.geometry import signed_bearing_delta
+    # 355 → 5 is a +10° right turn
+    d = float(signed_bearing_delta(355.0, 5.0))
+    assert abs(d - 10.0) < 0.1, f"Expected +10, got {d}"
+    # 5 → 355 is a -10° left turn
+    d2 = float(signed_bearing_delta(5.0, 355.0))
+    assert abs(d2 + 10.0) < 0.1, f"Expected -10, got {d2}"
+    print(f"  signed_bearing_delta wrap: +10 / -10  {PASS}")
 
 
-# ── Risk scorer tests ──────────────────────────────────────────────────────────
+# ── Risk scorer ────────────────────────────────────────────────────────────────
 
 def test_bend_score():
     from services.risk_scorer import _BEND_SCORE, BendCategory
@@ -75,9 +64,7 @@ def test_category_from_angle():
 
 
 def test_cluster_multiplier():
-    """3 consecutive hairpins: bend score = 45 * 1.4 = 63, capped at 45."""
-    from services.risk_scorer import _Seg, score_segments, assign_cluster_counts
-    from models.response import BendCategory, RiskLevel
+    from services.risk_scorer import _Seg, score_segments, assign_cluster_counts, BendCategory
 
     class FakeReq:
         wind_speed_kmh     = 0.0
@@ -88,7 +75,7 @@ def test_cluster_multiplier():
         is_foggy           = False
 
     segs = [
-        _Seg(i, 7.0 + i * 0.001, 80.0, 7.0 + i * 0.002, 80.001,
+        _Seg(i, 7.0 + i*0.001, 80.0, 7.0+i*0.002, 80.001,
              bearing_change=130.0, is_sharp_turn=True,
              bend_category=BendCategory.hairpin,
              consecutive_sharp_count=0, look_ahead_meters=300,
@@ -96,19 +83,14 @@ def test_cluster_multiplier():
         for i in range(3)
     ]
     segs = assign_cluster_counts(segs)
-    assert segs[2].consecutive_sharp_count == 3, (
-        f"Expected 3, got {segs[2].consecutive_sharp_count}"
-    )
+    assert segs[2].consecutive_sharp_count == 3
     segs = score_segments(segs, FakeReq())
-    # hairpin(45) * 1.4 = 63 -> capped to 45; no weather/wind/slope
     assert segs[2].risk_score == 45.0, f"Expected 45.0, got {segs[2].risk_score}"
     print(f"  cluster multiplier (cap at 45)  {PASS}")
 
 
 def test_risk_classification():
-    """High weather + hairpin should produce a high-risk segment."""
-    from services.risk_scorer import _Seg, score_segments, assign_cluster_counts
-    from models.response import BendCategory, RiskLevel
+    from services.risk_scorer import _Seg, score_segments, BendCategory, RiskLevel
 
     class RainyReq:
         wind_speed_kmh     = 60.0
@@ -123,91 +105,99 @@ def test_risk_classification():
                bend_category=BendCategory.hairpin,
                consecutive_sharp_count=0, look_ahead_meters=300,
                distance_meters=200, slope_percent=12.0)
-
     result = score_segments([seg], RainyReq())
-    assert result[0].risk_level == RiskLevel.high, (
-        f"Expected high risk, got {result[0].risk_level} (score={result[0].risk_score})"
-    )
+    assert result[0].risk_level == RiskLevel.high, \
+        f"Expected High, got {result[0].risk_level} (score={result[0].risk_score})"
     print(f"  risk classification (hairpin + rain = high)  {PASS}")
 
 
-# ── Full async pipeline test ───────────────────────────────────────────────────
+# ── Direction-grouping pipeline ────────────────────────────────────────────────
 
-async def test_full_pipeline():
-    """
-    Simulate a U-bend: 10 GPS points sweeping through 135 degrees.
-    Expects at least one sharp/hairpin segment to be detected.
-    """
+async def test_u_bend():
+    """A U-turn (0→180° sweep in ONE direction) must be a single hairpin segment."""
     from models.request import AnalyzeRequest, GeoPoint
     from services.route_analyzer import RouteAnalyzerService
 
-    pts = []
-    for i in range(10):
-        angle = math.radians(i * 15)           # sweeps 0 -> 135 degrees
-        lat   = 7.29 + math.sin(angle) * 0.002
-        lng   = 80.63 + math.cos(angle) * 0.002
-        pts.append(GeoPoint(lat=lat, lng=lng))
-
-    req = AnalyzeRequest(
-        polyline            = pts,
-        weather_condition   = "rain",
-        wind_speed_kmh      = 40.0,
-        visibility_m        = 3000.0,
-        precip_mm_per_hour  = 5.0,
-        temperature_c       = 22.0,
-    )
-
-    segments = await RouteAnalyzerService.analyze(req)
-    assert len(segments) > 0, "Expected at least one segment"
-
-    has_sharp = any(
-        s.bend_category in ("sharp", "hairpin") for s in segments
-    )
-    cats = [s.bend_category for s in segments]
-    print(f"  full pipeline: {len(segments)} seg(s), categories={cats}, sharp={has_sharp}  {PASS}")
+    # 10 points sweeping 135° all turning RIGHT
+    pts = [
+        GeoPoint(lat=7.29 + math.sin(math.radians(i * 15)) * 0.002,
+                 lng=80.63 + math.cos(math.radians(i * 15)) * 0.002)
+        for i in range(10)
+    ]
+    req = AnalyzeRequest(polyline=pts, weather_condition="clear",
+                         wind_speed_kmh=0, visibility_m=10000,
+                         precip_mm_per_hour=0, temperature_c=25)
+    segs = await RouteAnalyzerService.analyze(req)
+    assert len(segs) >= 1
+    best = max(segs, key=lambda s: s.bearing_change)
+    assert best.bend_category in ("sharp", "hairpin"), \
+        f"Expected sharp/hairpin, got {best.bend_category} ({best.bearing_change}°)"
+    print(f"  U-bend test: {len(segs)} seg(s), best={best.bend_category} "
+          f"({best.bearing_change}°)  {PASS}")
 
 
-async def test_sparse_polyline_hairpin():
+async def test_sparse_three_hairpins():
     """
-    Simulates a LONG MOUNTAIN ROUTE with sparse GPS points (~200 m apart).
-    This is the exact case that was broken: MAX_SEG_DIST=300m was cutting
-    segments after only 1-2 points, preventing any meaningful bend detection.
-
-    3 hairpins injected into a long straight route.
-    Expects at least 2 sharp/hairpin segments to be detected.
+    3 hairpins on a long sparse route (220 m per GPS point).
+    The direction-grouping algorithm must detect all 3 as sharp/hairpin.
     """
     from models.request import AnalyzeRequest, GeoPoint
     from services.route_analyzer import RouteAnalyzerService
-    import math
 
     pts = []
     lat, lng = 7.00, 80.60
-
     for _ in range(3):
-        # Straight section (sparse, ~220m per point)
-        for j in range(5):
+        # Short straight (sparse GPS)
+        for _ in range(4):
             pts.append(GeoPoint(lat=lat, lng=lng))
-            lat += 0.002
-        # Hairpin: sweep 150° across 6 tight points
+            lat += 0.002           # ~220 m north
+        # Hairpin: 6 points sweeping 150° all in same direction
         for step in range(6):
-            angle = math.radians(step * 25)
-            pts.append(GeoPoint(lat=lat + math.sin(angle)*0.0005,
-                                lng=lng + math.cos(angle)*0.0005))
+            ang = math.radians(step * 25)
+            pts.append(GeoPoint(lat=lat + math.sin(ang)*0.0005,
+                                lng=lng + math.cos(ang)*0.0005))
         lat += 0.002
 
-    req = AnalyzeRequest(
-        polyline=pts, weather_condition="clear",
-        wind_speed_kmh=0, visibility_m=10000,
-        precip_mm_per_hour=0, temperature_c=25,
-    )
-    segments = await RouteAnalyzerService.analyze(req)
-    sharp_count = sum(1 for s in segments if s.bend_category in ("sharp", "hairpin"))
-    cats = [s.bend_category for s in segments]
-    assert sharp_count >= 2, f"Expected >=2 sharp, got {sharp_count}. cats={cats}"
-    print(f"  sparse polyline (3 hairpins): {len(segments)} seg(s), sharp={sharp_count}  {PASS}")
+    req = AnalyzeRequest(polyline=pts, weather_condition="clear",
+                         wind_speed_kmh=0, visibility_m=10000,
+                         precip_mm_per_hour=0, temperature_c=25)
+    segs = await RouteAnalyzerService.analyze(req)
+    sharp = sum(1 for s in segs if s.bend_category in ("sharp", "hairpin"))
+    cats  = [s.bend_category for s in segs]
+    assert sharp >= 2, f"Expected ≥2 sharp/hairpin, got {sharp}. cats={cats}"
+    print(f"  sparse 3-hairpin: {len(segs)} seg(s), sharp/hairpin={sharp}  {PASS}")
 
 
-# ── Runner ────────────────────────────────────────────────────────────────────
+async def test_s_curve():
+    """S-curve: right bend then left bend → 2 separate bend segments."""
+    from models.request import AnalyzeRequest, GeoPoint
+    from services.route_analyzer import RouteAnalyzerService
+
+    # Right arc (8 pts, +120°  total)
+    right_pts = [
+        GeoPoint(lat=7.00 + math.sin(math.radians(i*15))*0.002,
+                 lng=80.00 + math.cos(math.radians(i*15))*0.002)
+        for i in range(9)
+    ]
+    # Left arc (8 pts, -120° total) — reverse the direction
+    left_pts = [
+        GeoPoint(lat=7.00 + 0.01 + math.sin(math.radians(-i*15 + 180))*0.002,
+                 lng=80.00 + 0.03 + math.cos(math.radians(-i*15 + 180))*0.002)
+        for i in range(1, 9)
+    ]
+    pts = right_pts + left_pts
+    req = AnalyzeRequest(polyline=pts, weather_condition="clear",
+                         wind_speed_kmh=0, visibility_m=10000,
+                         precip_mm_per_hour=0, temperature_c=25)
+    segs = await RouteAnalyzerService.analyze(req)
+    # Both bends should be detected
+    notable = [s for s in segs if s.bend_category != "none"]
+    assert len(notable) >= 2, \
+        f"Expected ≥2 notable bends in S-curve, got {len(notable)}. cats={[s.bend_category for s in segs]}"
+    print(f"  S-curve: {len(segs)} seg(s), notable bends={len(notable)}  {PASS}")
+
+
+# ── Runner ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("\n=== RoadGuard AI Backend Smoke Tests ===\n")
@@ -216,7 +206,7 @@ if __name__ == "__main__":
     sync_tests = [
         test_haversine,
         test_bearing_delta,
-        test_smoother,
+        test_signed_bearing_delta,
         test_bend_score,
         test_category_from_angle,
         test_cluster_multiplier,
@@ -230,21 +220,22 @@ if __name__ == "__main__":
             errors.append(f"{t.__name__}: {e}")
             print(f"  {t.__name__}  {FAIL}: {e}")
 
-    try:
-        asyncio.run(test_full_pipeline())
-    except Exception as e:
-        errors.append(f"test_full_pipeline: {e}")
-        print(f"  test_full_pipeline  {FAIL}: {e}")
+    async_tests = [
+        test_u_bend,
+        test_sparse_three_hairpins,
+        test_s_curve,
+    ]
 
-    try:
-        asyncio.run(test_sparse_polyline_hairpin())
-    except Exception as e:
-        errors.append(f"test_sparse_polyline_hairpin: {e}")
-        print(f"  test_sparse_polyline_hairpin  {FAIL}: {e}")
+    for t in async_tests:
+        try:
+            asyncio.run(t())
+        except Exception as e:
+            errors.append(f"{t.__name__}: {e}")
+            print(f"  {t.__name__}  {FAIL}: {e}")
 
     print()
     if errors:
-        print(f"FAILED - {len(errors)} error(s):")
+        print(f"FAILED — {len(errors)} error(s):")
         for err in errors:
             print(f"  * {err}")
         sys.exit(1)

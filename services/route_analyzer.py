@@ -1,36 +1,44 @@
 """
-Route Analyzer — main pipeline orchestrator.
+Route Analyzer v3 — Direction-Grouping Bend Detection.
 
-KEY INSIGHT:
-  Google Directions polylines vary enormously in density:
-    - Urban short route (5 km):  ~300 points → 1 point per 17 m
-    - Mountain long route (75 km): ~400 points → 1 point per 190 m
+WHY THIS APPROACH?
+  All previous distance-based and point-count approaches failed because
+  Google Directions polylines have wildly different GPS point densities:
+    - Urban 5 km route:    ~300 pts → spacing 17 m/pt
+    - Mountain 75 km route: ~400 pts → spacing 190 m/pt
 
-  The ONLY correct approach is to adapt the segment size to the ACTUAL
-  average point spacing of the received polyline.
+  Any fixed segment size works for one density but breaks for the other.
 
-  Target: ~300 m of road per segment. If points are 200 m apart, use
-  N_PTS=2 (1 edge = 200 m, 2 = 400 m). If points are 15 m apart, use
-  N_PTS=20 (covers 300 m).
+  Direction-grouping is DENSITY-AGNOSTIC:
+    - Groups consecutive GPS edges that turn in the same direction
+    - Right turns accumulate into one right-bend segment
+    - Left turns accumulate into one left-bend segment
+    - GPS jitter is suppressed by a NOISE_BAND dead zone
+    - Opposite-direction reversal = natural bend boundary
+    - Works identically for a 10 m/pt urban polyline and a 300 m/pt highway
 
-  Bend severity is always measured as the TOTAL direction change from the
-  first bearing in the segment to the last (entry-vs-exit). A hairpin
-  spread over 8 GPS edges reads as the full ~130°.
-
-  A secondary sliding-window scan (±HALF_WIN) ensures bends that straddle
-  two segment boundaries are still captured.
+ALGORITHM (5 steps):
+  1. Compute raw edge bearings [] shape (n-1,)
+  2. Compute signed turn delta at each interior waypoint:
+       delta[k] = between edge k-1 and edge k, in (-180, +180]
+       +ve = right turn, -ve = left turn
+  3. Walk all waypoints, holding a "current group":
+       |delta| < NOISE_BAND  → skip (GPS jitter)
+       sign matches group    → accumulate turn
+       sign differs          → flush group as a segment, start new
+  4. Flush final group. Split any group > MAX_SEG_M for rendering.
+  5. Score: accumulated bearing_change → BendCategory → risk score.
 """
 import numpy as np
 import logging
-from typing import List
+from typing import List, Tuple
 
 from models.request  import AnalyzeRequest
 from models.response import SegmentResponse
 from services.geometry import (
     haversine_meters,
     bearing_deg,
-    bearing_delta,
-    smooth_bearings_savgol,
+    signed_bearing_delta,
 )
 from services.elevation import fetch_elevations, compute_slopes
 from services.risk_scorer import (
@@ -42,11 +50,11 @@ from services.risk_scorer import (
 
 logger = logging.getLogger(__name__)
 
-TARGET_SEG_DIST_M = 150.0  # aim for ~150 m of road per segment (tighter = fewer missed bends)
-MIN_SEG_EDGES     = 2      # allow as few as 2 edges for dense urban polylines
-SG_WINDOW         = 3      # Savitzky-Golay smoother window (minimal, sparse-friendly)
-SHARP_THRESH      = 45.0   # degrees → is_sharp_turn = True (counts moderate bends and above)
-RAW_STEP_WEIGHT   = 1.2    # amplify raw single-step peaks to compensate for smoother softening
+# ── Algorithm constants ───────────────────────────────────────────────────────
+NOISE_BAND     = 3.0      # bearing changes smaller than this are GPS jitter — ignored
+SHARP_THRESH   = 45.0     # accumulated turn (°) → is_sharp_turn = True
+MAX_SEG_M      = 2000.0   # cap straight/gentle groups for UI rendering (metres)
+MIN_SEG_M      = 10.0     # don't create sub-10 m micro-segments at route edges
 
 
 class RouteAnalyzerService:
@@ -58,54 +66,43 @@ class RouteAnalyzerService:
         lngs = np.array([p.lng for p in req.polyline])
         n    = len(lats)
 
-        # ── Stage 1: raw edge bearings  (shape n-1) ───────────────────────────
-        raw_bearings = bearing_deg(lats[:-1], lngs[:-1], lats[1:], lngs[1:])
-        logger.debug("Raw bearings: %d edges", len(raw_bearings))
+        if n < 2:
+            return []
 
-        # ── Stage 2: gentle SG smoothing ──────────────────────────────────────
-        win = SG_WINDOW if len(raw_bearings) >= SG_WINDOW else len(raw_bearings)
-        if win >= 2:
-            smooth = smooth_bearings_savgol(raw_bearings, window=win, polyorder=1)
-        else:
-            smooth = raw_bearings.copy()
+        # ── Stage 1: raw edge bearings ─────────────────────────────────────────
+        raw_b = bearing_deg(lats[:-1], lngs[:-1], lats[1:], lngs[1:])
 
-        # ── Stage 3: edge distances ────────────────────────────────────────────
+        # ── Stage 2: edge distances ────────────────────────────────────────────
         edge_dists = haversine_meters(lats[:-1], lngs[:-1], lats[1:], lngs[1:])
 
-        # ── Stage 4: ADAPTIVE point-count-based segmentation ──────────────────
-        #   Compute actual average GPS point spacing for THIS polyline.
-        #   Then set N_PTS so that each segment covers ~TARGET_SEG_DIST_M metres.
-        n_edges      = len(edge_dists)
-        total_dist_m = float(edge_dists.sum())
-        avg_spacing  = total_dist_m / n_edges if n_edges > 0 else 100.0
+        # ── Stage 3: signed turn deltas at interior waypoints ─────────────────
+        #   delta[k] = turn at interior waypoint k+1
+        #   (between edge k and edge k+1),  k = 0 … n-3
+        if n >= 3:
+            deltas = np.array([
+                float(signed_bearing_delta(raw_b[k], raw_b[k + 1]))
+                for k in range(len(raw_b) - 1)
+            ])
+        else:
+            deltas = np.zeros(0)
 
-        # N_PTS: how many GPS edges per segment
-        # Dense (15m/pt)  → N_PTS = 300/15 = 20
-        # Sparse (300m/pt) → N_PTS = max(4, 300/300) = 4    ← minimum floor prevents collapse
-        # Very sparse (2km/pt) → N_PTS = 4 (floor kicks in)
-        N_PTS = max(MIN_SEG_EDGES, min(25, int(round(TARGET_SEG_DIST_M / avg_spacing))))
+        logger.info("Polyline: %d pts, %d edges, %d delta(s)",
+                    n, len(raw_b), len(deltas))
 
-        # Sliding window ±HALF_WIN: covers at least ±4 points for short segments
-        HALF_WIN = max(4, N_PTS // 2)
+        # ── Stage 4: direction-grouping segmentation ───────────────────────────
+        raw_segments = _group_by_direction(lats, lngs, raw_b, edge_dists, deltas)
+        logger.info("Detected %d segments via direction-grouping", len(raw_segments))
 
-        logger.info(
-            "Polyline: %d pts, avg_spacing=%.1f m → N_PTS=%d, HALF_WIN=%d",
-            n, avg_spacing, N_PTS, HALF_WIN,
-        )
-
-        raw_segments = _build_segments(lats, lngs, smooth, raw_bearings, edge_dists,
-                                       N_PTS, HALF_WIN)
-        logger.info("Built %d raw segments from %d GPS points", len(raw_segments), n)
-
-        # ── Stage 5: elevation → slope ────────────────────────────────────────
-        seg_points = [(s.start_lat, s.start_lng) for s in raw_segments]
-        seg_points.append((raw_segments[-1].end_lat, raw_segments[-1].end_lng))
-        elevations = await fetch_elevations(seg_points)
-        slopes     = compute_slopes(elevations, [s.distance_meters for s in raw_segments])
+        # ── Stage 5: elevation → slope ─────────────────────────────────────────
+        seg_pts = [(s.start_lat, s.start_lng) for s in raw_segments]
+        seg_pts.append((raw_segments[-1].end_lat, raw_segments[-1].end_lng))
+        elevations = await fetch_elevations(seg_pts)
+        slopes     = compute_slopes(elevations,
+                                    [s.distance_meters for s in raw_segments])
         for seg, slope in zip(raw_segments, slopes):
             seg.slope_percent = slope
 
-        # ── Stage 6: cluster counter + risk scorer ────────────────────────────
+        # ── Stage 6: cluster counting + risk scoring ───────────────────────────
         raw_segments = assign_cluster_counts(raw_segments)
         scored       = score_segments(raw_segments, req)
         logger.info("Scoring complete — %d segments", len(scored))
@@ -113,103 +110,118 @@ class RouteAnalyzerService:
         return _to_response(scored)
 
 
-# ── Adaptive point-count segmentation ────────────────────────────────────────
+# ── Direction-grouping core ───────────────────────────────────────────────────
 
-def _build_segments(
-    lats:         np.ndarray,
-    lngs:         np.ndarray,
-    smooth:       np.ndarray,  # shape (n-1,) — SG-smoothed bearings
-    raw_bearings: np.ndarray,  # shape (n-1,) — unsmoothed bearings (for step scan)
-    edge_dists:   np.ndarray,  # shape (n-1,)
-    N_PTS:        int,
-    HALF_WIN:     int,
+def _group_by_direction(
+    lats:       np.ndarray,
+    lngs:       np.ndarray,
+    raw_b:      np.ndarray,   # edge bearings, shape (n-1,)
+    edge_dists: np.ndarray,   # edge lengths,  shape (n-1,)
+    deltas:     np.ndarray,   # signed waypoint turns, shape (n-2,) or empty
 ) -> List[_Seg]:
     """
-    Cut the polyline into segments of N_PTS GPS edges.
+    Walk through all GPS waypoints.  At each interior waypoint, we have a
+    signed bearing delta.  Accumulate same-direction deltas into one group.
+    When the direction reverses (ignoring jitter), flush the group and start
+    a new one.
 
-    For each segment, bend severity = max(entry_vs_exit, sliding_window_peak):
-      • entry_vs_exit:
-          bearing_delta(smooth[seg_start], smooth[seg_end])
-          = total direction change across the whole segment
-      • sliding_window_peak:
-          For every index in the segment, measure bearing_delta over
-          a ±HALF_WIN window.  Catches single-apex bends that straddle
-          two segment boundaries.
+    Result: one _Seg per contiguous same-direction stretch of road.
     """
-    segments:   List[_Seg] = []
-    seg_start:  int        = 0   # point index of segment start
-    edge_count: int        = 0   # edges accumulated in current segment
-    acc_dist:   float      = 0.0
+    n        = len(lats)
+    segments: List[_Seg] = []
 
-    n = len(lats)
+    # State of the current group
+    seg_start  = 0       # point index where this group started
+    acc_turn   = 0.0     # accumulated |delta| (°) in this direction
+    acc_dist   = 0.0     # accumulated road distance (m)
+    cur_dir    = 0       # +1 = right, -1 = left, 0 = undecided
 
-    def _flush(end_point_idx: int):
-        nonlocal seg_start, edge_count, acc_dist
-        if end_point_idx <= seg_start:
+    def _flush(end_pt: int):
+        """Close out the current group and append a _Seg."""
+        nonlocal seg_start, acc_turn, acc_dist, cur_dir
+
+        if end_pt <= seg_start or acc_dist < MIN_SEG_M:
             return
 
-        # bearing indices: smooth[i] is the bearing of edge i→i+1
-        b_lo = seg_start                              # first edge in segment
-        b_hi = min(end_point_idx - 1, len(smooth) - 1)  # last edge in segment
-
-        # ── Entry-vs-exit: total direction change across the segment ──────────
-        if b_hi > b_lo:
-            entry_exit = float(bearing_delta(smooth[b_lo], smooth[b_hi]))
-        else:
-            entry_exit = 0.0
-
-        # ── Sliding-window on smoothed bearings (catches gradual bends) ───────
-        sw_peak = entry_exit
-        for mid in range(b_lo, b_hi + 1):
-            lo = max(mid - HALF_WIN, 0)
-            hi = min(mid + HALF_WIN, len(smooth) - 1)
-            if hi > lo:
-                d = float(bearing_delta(smooth[lo], smooth[hi]))
-                if d > sw_peak:
-                    sw_peak = d
-
-        # ── Raw consecutive-pair step scan (catches sparse single-edge bends) ─
-        #   The SG smoother softens a real 60° bend at one GPS edge to ~30°.
-        #   Raw edge-to-edge bearing deltas bypass the smoother completely and
-        #   recover the true instantaneous bend at each GPS corner point.
-        raw_step_peak = 0.0
-        for k in range(b_lo, b_hi):
-            if k + 1 < len(raw_bearings):
-                d = float(bearing_delta(raw_bearings[k], raw_bearings[k + 1]))
-                if d > raw_step_peak:
-                    raw_step_peak = d
-        # Slightly amplify to compensate for residual smoother softening
-        raw_step_peak = min(raw_step_peak * RAW_STEP_WEIGHT, 180.0)
-
-        peak_delta = max(entry_exit, sw_peak, raw_step_peak)
-        cat        = category_from_angle(peak_delta)
-
-        segments.append(_Seg(
+        seg = _Seg(
             segment_index           = len(segments),
             start_lat               = float(lats[seg_start]),
             start_lng               = float(lngs[seg_start]),
-            end_lat                 = float(lats[end_point_idx]),
-            end_lng                 = float(lngs[end_point_idx]),
-            bearing_change          = round(peak_delta, 2),
-            is_sharp_turn           = peak_delta >= SHARP_THRESH,
-            bend_category           = cat,
+            end_lat                 = float(lats[end_pt]),
+            end_lng                 = float(lngs[end_pt]),
+            bearing_change          = round(acc_turn, 2),
+            is_sharp_turn           = acc_turn >= SHARP_THRESH,
+            bend_category           = category_from_angle(acc_turn),
             consecutive_sharp_count = 0,
             look_ahead_meters       = 300.0,
-            distance_meters         = round(max(acc_dist, 0.1), 1),
+            distance_meters         = round(acc_dist, 1),
             slope_percent           = 0.0,
-        ))
+        )
+        segments.append(seg)
 
-        seg_start  = end_point_idx
-        edge_count = 0
-        acc_dist   = 0.0
+        seg_start = end_pt
+        acc_turn  = 0.0
+        acc_dist  = 0.0
+        cur_dir   = 0
 
     for i in range(1, n):
-        edge_count += 1
-        acc_dist   += float(edge_dists[i - 1])
-        is_last     = (i == n - 1)
+        # Accrue this edge's distance into the current group
+        acc_dist += float(edge_dists[i - 1])
 
-        if (edge_count >= N_PTS and edge_count >= MIN_SEG_EDGES) or is_last:
+        # delta index: delta between edge i-1 and edge i is deltas[i-1]
+        #              valid only when i < n-1 (interior waypoints only)
+        if i < n - 1 and len(deltas) > 0:
+            d   = float(deltas[i - 1])
+            abs_d = abs(d)
+
+            if abs_d >= NOISE_BAND:
+                new_dir = 1 if d > 0 else -1
+
+                if cur_dir == 0:
+                    # First real turn in this group — just pick a direction
+                    cur_dir   = new_dir
+                    acc_turn += abs_d
+
+                elif new_dir == cur_dir:
+                    # Continuing in the same direction — accumulate
+                    acc_turn += abs_d
+
+                else:
+                    # Direction REVERSED — this waypoint is the boundary.
+                    # The incoming edge belongs to the OLD group (already
+                    # added to acc_dist above).  Flush the old group, then
+                    # begin the new group at this waypoint.
+                    _flush(i)
+                    cur_dir   = new_dir
+                    acc_turn += abs_d
+                    # acc_dist was reset in _flush; the OUTGOING edge from
+                    # waypoint i will be added in the NEXT iteration.
+
+            # else: |d| < NOISE_BAND → jitter, ignore, stay in current group
+
+        # Distance cap: split very long segments for UI rendering quality
+        if acc_dist >= MAX_SEG_M:
             _flush(i)
+
+    # Flush whatever remains
+    _flush(n - 1)
+
+    # Safety: if nothing was produced (e.g. only 2 points), return one segment
+    if not segments:
+        segments.append(_Seg(
+            segment_index=0,
+            start_lat=float(lats[0]),   start_lng=float(lngs[0]),
+            end_lat=float(lats[-1]),    end_lng=float(lngs[-1]),
+            bearing_change=0.0, is_sharp_turn=False,
+            bend_category=category_from_angle(0.0),
+            consecutive_sharp_count=0, look_ahead_meters=300.0,
+            distance_meters=round(float(edge_dists.sum()), 1),
+            slope_percent=0.0,
+        ))
+
+    # Re-index
+    for idx, s in enumerate(segments):
+        s.segment_index = idx
 
     return segments
 
