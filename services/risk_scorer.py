@@ -30,13 +30,17 @@ from models.response import BendCategory, RiskLevel, SegmentResponse
 
 
 # -- Bend score lookup --------------------------------------------------------
-
+# Calibrated so that:
+#   - A sharp bend (65-100deg) ALONE = Medium (45 pts, threshold 60)
+#   - A sharp bend + rain/fog       = High   (45+20 = 65 pts)
+#   - A hairpin (100deg+) ALONE     = High   (65 pts)
+#   - A roundabout suppressed by intersection filter = 0 pts
 _BEND_SCORE: dict[BendCategory, float] = {
     BendCategory.none:     0.0,
-    BendCategory.gentle:   10.0,  # 20-35 deg  -> Low
-    BendCategory.moderate: 25.0,  # 35-55 deg  -> Medium
-    BendCategory.sharp:    50.0,  # 55-85 deg  -> High
-    BendCategory.hairpin:  75.0,  # 85+ deg    -> Very High
+    BendCategory.gentle:   8.0,   # 20-35 deg  -> Low
+    BendCategory.moderate: 20.0,  # 35-65 deg  -> Low/Medium
+    BendCategory.sharp:    45.0,  # 65-100 deg -> Medium alone, High + weather
+    BendCategory.hairpin:  65.0,  # 100+ deg   -> High alone
 }
 
 
@@ -103,20 +107,21 @@ def _score(seg: _Seg, req) -> tuple[float, RiskLevel, float]:
 
 def _weather_score(req) -> float:
     cond = req.weather_condition.lower()
-    if cond == "thunderstorm":                        return 30.0
+    if cond == "thunderstorm":                        return 25.0
     if cond == "rain":
-        return 20.0 + min(req.precip_mm_per_hour * 2, 10.0)
-    if cond == "drizzle":                             return 15.0
-    if cond == "snow":                                return 25.0
-    if cond in ("fog", "mist", "haze"):               return 20.0
-    if cond in ("smoke", "dust", "sand"):             return 15.0
-    if req.visibility_m < 1000:                       return 20.0
-    if req.visibility_m < 3000:                       return 10.0
+        return 15.0 + min(req.precip_mm_per_hour * 2, 10.0)
+    if cond == "drizzle":                             return 10.0  # was 15
+    if cond == "snow":                                return 22.0
+    if cond in ("fog", "mist", "haze"):               return 18.0
+    if cond in ("smoke", "dust", "sand"):             return 12.0
+    if req.visibility_m < 500:                        return 18.0  # very low vis
+    if req.visibility_m < 1000:                       return 12.0
+    if req.visibility_m < 3000:                       return 6.0
     return 0.0
 
 
 def _classify(score: float) -> RiskLevel:
-    if score >= 50: return RiskLevel.high
+    if score >= 60: return RiskLevel.high    # raised from 50
     if score >= 25: return RiskLevel.medium
     return RiskLevel.low
 
@@ -151,14 +156,14 @@ def assign_cluster_counts(segments: list[_Seg]) -> list[_Seg]:
 # -- BendCategory classifier --------------------------------------------------
 
 def category_from_angle(angle: float) -> BendCategory:
-    """Calibrated per user specification:
-      hairpin  >= 85 degrees
-      sharp    >= 55 degrees
-      moderate >= 35 degrees
-      gentle   >= 20 degrees
+    """Calibrated thresholds:
+      hairpin  >= 100 degrees  (true hairpin / very sharp bend)
+      sharp    >=  65 degrees  (needs weather to reach High risk)
+      moderate >=  35 degrees
+      gentle   >=  20 degrees
     """
-    if angle >= 85: return BendCategory.hairpin
-    if angle >= 55: return BendCategory.sharp
-    if angle >= 35: return BendCategory.moderate
-    if angle >= 20: return BendCategory.gentle
+    if angle >= 100: return BendCategory.hairpin
+    if angle >=  65: return BendCategory.sharp
+    if angle >=  35: return BendCategory.moderate
+    if angle >=  20: return BendCategory.gentle
     return BendCategory.none
