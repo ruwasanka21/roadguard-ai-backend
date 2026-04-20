@@ -62,6 +62,25 @@ SCAN_WIN            = 6      # edges — half-window for localised peak scan
 SHARP_THRESH        = 55.0   # °  — is_sharp_turn = True above this
 MAX_SEG_M           = 2000.0 # m  — cap for straight/gentle groups (rendering)
 MIN_SEG_M           = 5.0    # m  — ignore zero-length artefacts
+INTERSECTION_RADIUS = 40.0  # m  — suppress sharp-turn if within this distance of a step endpoint
+
+
+def _is_intersection_point(lat: float, lng: float, req: AnalyzeRequest) -> bool:
+    """
+    Returns True if (lat, lng) is within INTERSECTION_RADIUS metres of any
+    Google Directions step endpoint. Such points are planned navigation turns
+    (e.g. 'Turn right at the junction'), NOT dangerous road bends.
+    """
+    if not req.step_endpoints:
+        return False
+    for ep in req.step_endpoints:
+        dist = haversine_meters(
+            np.array([lat]),  np.array([lng]),
+            np.array([ep.lat]), np.array([ep.lng])
+        )[0]
+        if dist <= INTERSECTION_RADIUS:
+            return True
+    return False
 
 
 class RouteAnalyzerService:
@@ -96,7 +115,7 @@ class RouteAnalyzerService:
 
         # ── Stage 3: direction-grouping with reversal tolerance ───────────────
         raw_segments, seg_edge_ranges = _group_by_direction_tolerant(
-            lats, lngs, raw_b, edge_dists, deltas
+            lats, lngs, raw_b, edge_dists, deltas, req
         )
         logger.info("Direction-grouping → %d segments", len(raw_segments))
 
@@ -127,6 +146,7 @@ def _group_by_direction_tolerant(
     raw_b:      np.ndarray,
     edge_dists: np.ndarray,
     deltas:     np.ndarray,
+    req:        AnalyzeRequest = None,
 ):
     """
     Walk the polyline. Group consecutive edges that turn in the same direction.
@@ -154,6 +174,21 @@ def _group_by_direction_tolerant(
         end_edge   = end_pt - 1        # last edge ending at end_pt
         dir_str    = "right" if cur_dir == 1 else "left" if cur_dir == -1 else "straight"
         seg_points = [{"lat": float(lats[k]), "lng": float(lngs[k])} for k in range(seg_start, end_pt + 1)]
+
+        # ── Intersection suppression ──────────────────────────────────────────
+        # If this segment's START point is near a navigation instruction endpoint,
+        # the turn is a deliberate driver action (e.g. "Turn right at junction"),
+        # NOT an unexpected road bend. Zero out the angle so it is not flagged.
+        at_intersection = _is_intersection_point(
+            float(lats[seg_start]), float(lngs[seg_start]), req
+        )
+        effective_turn = 0.0 if at_intersection else acc_turn
+        if at_intersection:
+            logger.debug(
+                "Seg %d suppressed — intersection at (%.5f, %.5f), raw angle=%.1f°",
+                len(segments), lats[seg_start], lngs[seg_start], acc_turn,
+            )
+
         segments.append(_Seg(
             segment_index           = len(segments),
             start_lat               = float(lats[seg_start]),
@@ -161,10 +196,10 @@ def _group_by_direction_tolerant(
             end_lat                 = float(lats[end_pt]),
             end_lng                 = float(lngs[end_pt]),
             points                  = seg_points,
-            bearing_change          = round(acc_turn, 2),
-            turn_direction          = dir_str,
-            is_sharp_turn           = acc_turn >= SHARP_THRESH,
-            bend_category           = category_from_angle(acc_turn),
+            bearing_change          = round(effective_turn, 2),
+            turn_direction          = dir_str if not at_intersection else "straight",
+            is_sharp_turn           = effective_turn >= SHARP_THRESH,
+            bend_category           = category_from_angle(effective_turn),
             consecutive_sharp_count = 0,
             look_ahead_meters       = 300.0,
             distance_meters         = round(acc_dist, 1),
