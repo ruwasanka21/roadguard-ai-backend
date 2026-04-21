@@ -20,10 +20,10 @@ Category angle thresholds (tuned for mountain driving):
   gentle   >=  10 degrees
 
 Dynamic look-ahead:
-  hairpin  -> 800 m
-  sharp    -> 600 m
-  moderate -> 350 m (450 m in rain/fog)
-  other    -> 300 m
+  hairpin  -> 500 m
+  sharp    -> 250 m
+  moderate -> 150 m (250 m in rain/fog)
+  other    -> 250 m
 """
 from dataclasses import dataclass
 from models.response import BendCategory, RiskLevel, SegmentResponse
@@ -128,12 +128,12 @@ def _classify(score: float) -> RiskLevel:
 
 def _look_ahead(seg: _Seg, req) -> float:
     if seg.bend_category == BendCategory.hairpin:
-        return 800.0
+        return 250.0
     if seg.bend_category == BendCategory.sharp:
-        return 600.0
+        return 250.0
     if seg.bend_category == BendCategory.moderate:
-        return 450.0 if (req.is_rainy or req.is_foggy) else 350.0
-    return 300.0
+        return 150.0 if (req.is_rainy or req.is_foggy) else 250.0
+    return 250.0
 
 
 # -- Cluster counter ----------------------------------------------------------
